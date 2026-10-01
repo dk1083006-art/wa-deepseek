@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 bot.py — Number Extractor Bot v5.5
-Render Web Service + Termux compatible.
-- Binds health shim on $PORT first, reaps stale holders, falls back only if needed.
+Railway / Render / Termux compatible.
+- Binds health shim on $PORT first (Railway/Render), reaps stale holders, falls back only if needed.
 - Single init under lock. Signal-driven shutdown. atexit session cleanup.
 - Cross-cycle visit budget. srcdoc depth guard. Worker crash isolation.
 """
@@ -46,6 +46,22 @@ except ImportError:
     sys.stderr.write("missing dependency: requests\nrun: pip install requests\n")
     sys.exit(2)
 
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    import brotli  # type: ignore  # noqa: F401
+    _HAS_BROTLI = True
+except ImportError:
+    try:
+        import brotlicffi  # type: ignore  # noqa: F401
+        _HAS_BROTLI = True
+    except ImportError:
+        _HAS_BROTLI = False
+
 # =============================================================================
 # 1. CONFIG
 # =============================================================================
@@ -76,7 +92,12 @@ def _resolve_work_dir() -> Path:
     if env:
         candidates.append(Path(env))
 
-    candidates.append(Path("/sdcard/wp1"))
+    vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    if vol:
+        candidates.append(Path(vol) / "wp1")
+
+    if Path("/sdcard").is_dir():  # Termux / Android only
+        candidates.append(Path("/sdcard/wp1"))
 
     try:
         project_dir = Path(__file__).resolve().parent
@@ -149,6 +170,8 @@ except (OSError, PermissionError) as _e:
     sys.stderr.write(f"warn: could not create log dir, using WORK_DIR root: {_e}\n")
 
 MAX_URL_LEN: int = 4096
+MAX_BODY_BYTES: int = 4 * 1024 * 1024
+TG_MAX_TEXT: int = 4000
 CSV_HEADER: list[str] = ["number", "confidence", "country", "hop", "url", "surface", "context"]
 
 # =============================================================================
@@ -371,10 +394,10 @@ def _setup_logging() -> logging.Logger:
             logger.addHandler(h)
         except (OSError, PermissionError) as e:
             sys.stderr.write(f"warn: file logging disabled: {e}\n")
-    if CONFIG["VERBOSE"] or os.environ.get("RENDER"):
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-        logger.addHandler(sh)
+    # always log to stdout so Railway / Render dashboards show output
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(sh)
     return logger
 
 
@@ -572,7 +595,7 @@ def build_headers(referer: Optional[str] = None) -> dict[str, str]:
         "User-Agent": random_ua(),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate, br" if _HAS_BROTLI else "gzip, deflate",
         "Upgrade-Insecure-Requests": "1",
         "dnt": "1",
         "X-Requested-With": "via.bolte",
@@ -603,23 +626,48 @@ def make_session() -> requests.Session:
     return s
 
 
+def _read_capped(resp: requests.Response) -> requests.Response:
+    """Read at most MAX_BODY_BYTES of a streamed response so huge downloads can't OOM the container."""
+    try:
+        buf = bytearray()
+        for chunk in resp.iter_content(65536):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) >= MAX_BODY_BYTES:
+                break
+        resp._content = bytes(buf)  # type: ignore[attr-defined]
+        resp._content_consumed = True  # type: ignore[attr-defined]
+    except (requests.exceptions.RequestException, OSError, ValueError, ssl.SSLError):
+        resp._content = b""  # type: ignore[attr-defined]
+        resp._content_consumed = True  # type: ignore[attr-defined]
+    finally:
+        try:
+            resp.close()
+        except (OSError, requests.exceptions.RequestException):
+            pass
+    return resp
+
+
 def _ssl_ladder_get(session: requests.Session, url: str, headers: dict[str, str],
                     allow_redirects: bool) -> Optional[requests.Response]:
     try:
-        return session.get(url, headers=headers, timeout=CONFIG["TIMEOUT"],
-                           allow_redirects=allow_redirects)
+        return _read_capped(session.get(url, headers=headers, timeout=CONFIG["TIMEOUT"],
+                                        allow_redirects=allow_redirects, stream=True))
     except requests.exceptions.SSLError:
         LOG.debug("ssl ladder: verify=False for %s", url[:120])
         try:
-            return session.get(url, headers=headers, timeout=CONFIG["TIMEOUT"],
-                               allow_redirects=allow_redirects, verify=False)
+            return _read_capped(session.get(url, headers=headers, timeout=CONFIG["TIMEOUT"],
+                                            allow_redirects=allow_redirects, verify=False,
+                                            stream=True))
         except requests.exceptions.RequestException:
             if url.startswith("https://"):
                 http_url = "http://" + url[len("https://"):]
                 try:
-                    return session.get(http_url, headers=headers,
-                                       timeout=CONFIG["TIMEOUT"],
-                                       allow_redirects=allow_redirects)
+                    return _read_capped(session.get(http_url, headers=headers,
+                                                    timeout=CONFIG["TIMEOUT"],
+                                                    allow_redirects=allow_redirects,
+                                                    stream=True))
                 except requests.exceptions.RequestException:
                     return None
             return None
@@ -1841,6 +1889,11 @@ def tg(method: str, **kwargs: Any) -> dict[str, Any]:
     url = API + "/" + method
     with TG_LOCK:
         for _attempt in range(2):
+            for _f in (kwargs.get("files") or {}).values():
+                try:
+                    _f[1].seek(0)
+                except (OSError, AttributeError, IndexError, TypeError):
+                    pass
             try:
                 r = TG_SESSION.post(url, timeout=60, **kwargs)
             except requests.exceptions.RequestException as e:
@@ -1875,7 +1928,7 @@ def tg(method: str, **kwargs: Any) -> dict[str, Any]:
 def send_msg(chat_id: int, text: str,
              reply_markup: Optional[dict] = None) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "chat_id": chat_id, "text": text, "disable_web_page_preview": True,
+        "chat_id": chat_id, "text": text[:TG_MAX_TEXT], "disable_web_page_preview": True,
     }
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
@@ -1884,7 +1937,7 @@ def send_msg(chat_id: int, text: str,
 
 def edit_msg(chat_id: int, msg_id: int, text: str,
              reply_markup: Optional[dict] = None) -> dict[str, Any]:
-    data: dict[str, Any] = {"chat_id": chat_id, "message_id": msg_id, "text": text}
+    data: dict[str, Any] = {"chat_id": chat_id, "message_id": msg_id, "text": text[:TG_MAX_TEXT]}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     return tg("editMessageText", data=data)
@@ -1905,7 +1958,7 @@ def send_doc(chat_id: int, path: str, caption: str = "") -> dict[str, Any]:
 # =============================================================================
 
 STATE: dict[int, dict[str, Any]] = {}
-STATE_LOCK = threading.Lock()
+STATE_LOCK = threading.RLock()  # re-entrant: set_state() calls get_state()
 CANCEL_EVENTS: dict[int, threading.Event] = {}
 WATCHES: dict[int, list[dict[str, Any]]] = defaultdict(list)
 HISTORY: dict[int, deque] = defaultdict(lambda: deque(maxlen=20))
@@ -2090,7 +2143,7 @@ def handle_text(chat_id: int, text: str, msg_id: int) -> None:
         if len(WATCHES[chat_id]) >= 5:
             send_msg(chat_id, "max 5 watches per chat")
             return
-        WATCHES[chat_id].append({"url": parts[1], "interval": interval, "last": set()})
+        WATCHES[chat_id].append({"url": parts[1], "interval": interval, "last": set(), "ran": 0.0})
         send_msg(chat_id, "👁 watching " + parts[1][:80])
         return
     if text == "/mirrors":
@@ -2210,9 +2263,18 @@ def _write_vcard_atomic(path: Path, numbers: list[str]) -> None:
 
 
 def start_extraction(chat_id: int, urls: list[str], n: int) -> None:
+    with STATE_LOCK:
+        st_now = get_state(chat_id)
+        if st_now.get("step") == "running":
+            already = True
+        else:
+            already = False
+            st_now["step"] = "running"
+    if already:
+        send_msg(chat_id, "⏳ ek extraction already chal raha hai — /cancel karo ya wait karo")
+        return
     ev = threading.Event()
     CANCEL_EVENTS[chat_id] = ev
-    set_state(chat_id, step="running")
 
     status = send_msg(chat_id,
                       "⏳ *Starting extraction...*\n\n"
@@ -2437,8 +2499,8 @@ def top_numbers(chat_id: int) -> None:
 
 
 def diff_files(chat_id: int, a: str, b: str) -> None:
-    pa = CONFIG["WORK_DIR"] / a
-    pb = CONFIG["WORK_DIR"] / b
+    pa = CONFIG["WORK_DIR"] / Path(a).name
+    pb = CONFIG["WORK_DIR"] / Path(b).name
     if not pa.exists() or not pb.exists():
         send_msg(chat_id, "file not found")
         return
@@ -2510,6 +2572,44 @@ def handle_update(u: dict[str, Any]) -> None:
                             cq["message"]["message_id"])
     except Exception as e:
         LOG.warning("update handler: %s", str(e)[:200])
+        try:
+            chat = (u.get("message") or (u.get("callback_query") or {}).get("message") or {}).get("chat", {})
+            if chat.get("id") is not None and is_allowed(chat["id"]):
+                send_msg(chat["id"], "⚠️ error: " + str(e)[:150])
+                with STATE_LOCK:
+                    if get_state(chat["id"]).get("step") in ("running", "analyzing"):
+                        get_state(chat["id"])["step"] = "idle"
+        except Exception:  # noqa: BLE001
+            pass
+
+
+HANDLER_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="upd")
+
+
+def _watch_loop() -> None:
+    """Background runner for /watch entries (previously registered but never executed)."""
+    while True:
+        time.sleep(5)
+        try:
+            now = time.time()
+            for chat_id, items in list(WATCHES.items()):
+                for w in list(items):
+                    if now - w.get("ran", 0.0) < max(30, int(w.get("interval", 300))):
+                        continue
+                    w["ran"] = now
+                    res = worker_scrape(w["url"], None, CONFIG["WALL_CLOCK_PER_WORKER"],
+                                        VisitBudget(CONFIG["MAX_VISITED"]))
+                    found = set(res.keys())
+                    new = sorted(found - w["last"])
+                    if new and w["last"]:
+                        send_msg(chat_id, "👁 " + w["url"][:60] + " — "
+                                 + str(len(new)) + " new:\n" + "\n".join(new[:20]))
+                    elif new:
+                        send_msg(chat_id, "👁 " + w["url"][:60] + " — baseline "
+                                 + str(len(new)) + " numbers")
+                    w["last"] |= found
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("watch loop: %s", str(e)[:160])
 
 
 def prepare_polling() -> None:
@@ -2536,6 +2636,8 @@ def poll() -> None:
     else:
         raise RuntimeError("Telegram getMe failed: " + str(me.get("description", "unknown error")))
 
+    threading.Thread(target=_watch_loop, daemon=True, name="watch").start()
+
     offset = 0
     fail_streak = 0
     while True:
@@ -2547,6 +2649,9 @@ def poll() -> None:
             if not data.get("ok"):
                 fail_streak += 1
                 LOG.warning("getUpdates not ok: %s", data.get("description"))
+                if data.get("error_code") == 409:
+                    LOG.warning("409 conflict: another instance is polling this bot token "
+                                "(stop the Render/Termux/local copy or old Railway deploy)")
                 if fail_streak >= 5:
                     try:
                         TG_SESSION.close()
@@ -2562,7 +2667,9 @@ def poll() -> None:
             fail_streak = 0
             for u in data.get("result", []):
                 offset = u["update_id"] + 1
-                handle_update(u)
+                # run handlers off the poll thread so /cancel, buttons and new
+                # messages keep working while an extraction is running
+                HANDLER_POOL.submit(handle_update, u)
         except requests.exceptions.RequestException as e:
             fail_streak += 1
             LOG.warning("poll net err: %s", str(e)[:120])
@@ -2691,7 +2798,7 @@ def run_self_test() -> tuple[int, int, list[str]]:
     return total - len(failures), total, failures
 
 # =============================================================================
-# 20. RENDER SHIM (health endpoint on $PORT only)
+# 20. HEALTH SHIM (Railway/Render health endpoint on $PORT only)
 # =============================================================================
 
 _SHIM_SERVER: Optional[Any] = None
@@ -2716,7 +2823,7 @@ def _port_in_use(port: int, host: str = "0.0.0.0") -> bool:
 
 def _kill_stale_shim_on_port(port: int) -> bool:
     """
-    If something is already listening on the Render $PORT and it looks like
+    If something is already listening on the platform $PORT and it looks like
     a previous instance of our own shim, kill it via lsof or fuser.
     Termux has neither by default — the function no-ops and returns False
     there, letting the fallback walk proceed normally.
@@ -2769,7 +2876,7 @@ def _start_render_shim() -> Optional[int]:
     Bind a health endpoint once.
 
     Order:
-      1. $PORT as Render injects it — after clearing any stale holder.
+      1. $PORT as Railway/Render injects it — after clearing any stale holder.
       2. Fallback list from CONFIG.
 
     EADDRINUSE is never fatal. If every candidate fails, return None and the
@@ -2837,7 +2944,7 @@ def _start_render_shim() -> Optional[int]:
 
             if primary_port is not None and port != primary_port:
                 LOG.warning(
-                    "shim bound on %d but Render probes $PORT=%d — health endpoint "
+                    "shim bound on %d but the platform probes $PORT=%d — health endpoint "
                     "may be unreachable from the edge. Redeploy with a clean "
                     "container to reclaim $PORT.",
                     port, primary_port,
@@ -2872,7 +2979,7 @@ def _cli() -> int:
     parser.add_argument("--verbose", action="store_true",
                         help="verbose logging")
     parser.add_argument("--no-shim", action="store_true",
-                        help="do not start the render health shim")
+                        help="do not start the health-check HTTP shim")
     args = parser.parse_args()
     if args.verbose:
         CONFIG["VERBOSE"] = True
@@ -2897,10 +3004,15 @@ def _cli() -> int:
     except (ValueError, OSError):
         pass
 
+    rc = 0
     try:
         poll()
+        rc = 1  # poll() only returns after repeated failures -> let Railway restart us
     except KeyboardInterrupt:
         LOG.info("keyboard interrupt — exiting")
+    except RuntimeError as e:
+        LOG.error("fatal: %s", e)
+        rc = 1
     finally:
         global _SHIM_SERVER
         if _SHIM_SERVER is not None:
@@ -2909,7 +3021,7 @@ def _cli() -> int:
             except Exception:
                 pass
         _close_tg_session()
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
