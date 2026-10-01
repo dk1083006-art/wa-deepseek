@@ -99,7 +99,7 @@ def _resolve_work_dir() -> Path:
 
 
 CONFIG: dict[str, Any] = {
-    "TG_TOKEN": os.environ.get("TG_TOKEN", "8870118783:AAFo1cFeSioqt4JJOv0Ca3VT2mBUceBCQJM").strip(),
+    "TG_TOKEN": os.environ.get("TG_TOKEN", "").strip(),
     "ALLOWED_CHATS": {
         int(x) for x in os.environ.get(
             "ALLOWED_CHATS", "8753914631,8565258976"
